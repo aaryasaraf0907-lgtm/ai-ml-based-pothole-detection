@@ -1,0 +1,1494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TransitEye — Live Detection System</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+  import { getFirestore, collection, onSnapshot, query, orderBy, limit } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDOItu4ftIsOiYiM05AkZw84WGDXTy8idM",
+    authDomain: "pothole-severity.firebaseapp.com",
+    projectId: "pothole-severity",
+    storageBucket: "pothole-severity.firebasestorage.app",
+    messagingSenderId: "885236085237",
+    appId: "1:885236085237:web:b597a4d1cfce221bb2f0bc",
+    measurementId: "G-9L0NCTXHP1"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getFirestore(app);
+
+  // ── Map setup ──────────────────────────────────────────────────────────
+  const map = L.map('map', { zoomControl: false }).setView([18.5204, 73.8567], 13);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=YOUR_CARTO_BASEMAPS_API_KEY', {
+    attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 19
+  }).addTo(map);
+  L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+  const markers = {};       // id -> {marker, severity}
+  let totalCount = 0, minorCount = 0, modCount = 0, sevCount = 0;
+  let currentFilter = 'all';
+  let followLatest = false;
+  const allDocs = {};       // id -> full doc data, for feed click lookup
+  const busFeedDocs = {};  // id -> recent bus-camera detection data
+  const roadDefectMarkers = {}; // id -> persistent road-defect circle marker
+  const roadDefectDocs = {}; // id -> persistent road-defect data
+
+  function severityColor(s) {
+    if (s === 'severe') return '#FF3B3B';
+    if (s === 'moderate') return '#FF9500';
+    return '#30D158';
+  }
+
+  function severityIcon(severity) {
+    const color = severityColor(severity);
+    const size = severity === 'severe' ? 18 : severity === 'moderate' ? 14 : 10;
+    return L.divIcon({
+      className: '',
+      html: `<div style="width:${size}px;height:${size}px;background:${color};border-radius:50%;border:2px solid rgba(255,255,255,0.8);box-shadow:0 0 ${size}px ${color}88;animation:pulse 2s infinite"></div>`,
+      iconSize: [size, size],
+      iconAnchor: [size/2, size/2]
+    });
+  }
+
+  function formatTime(ts) {
+    if (!ts) return '—';
+    const d = ts.toDate ? ts.toDate() : new Date(ts);
+    return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  // ── Persistent road-defect layer ─────────────────────────────────────────
+  function isResolvedDefect(d) {
+    return (d.maintenance_status || '').toLowerCase() === 'resolved' ||
+           (d.verification_status || '').toLowerCase() === 'verified';
+  }
+
+  function roadDefectColor(d) {
+    if (isResolvedDefect(d)) return '#30D158';
+    const severity = d.severity || 'minor';
+    return severityColor(severity);
+  }
+
+  function consensusLabel(status) {
+    const labels = {
+      reported: 'REPORTED',
+      repeated: 'REPEATED',
+      confirmed: 'CONFIRMED',
+      verified: 'VERIFIED'
+    };
+    return labels[status] || 'REPORTED';
+  }
+
+  function priorityLabel(priority) {
+    const labels = {
+      preventive: 'PREVENTIVE',
+      scheduled: 'SCHEDULED',
+      high: 'HIGH',
+      urgent: 'URGENT',
+      critical: 'CRITICAL'
+    };
+    return labels[priority] || 'PENDING';
+  }
+
+  function priorityColor(priority) {
+    if (priority === 'critical') return '#FF3B3B';
+    if (priority === 'urgent' || priority === 'high') return '#FF9500';
+    return '#30D158';
+  }
+
+  function roadDefectPopup(id, d) {
+    const resolved = isResolvedDefect(d);
+    const color = roadDefectColor(d);
+    const priority = d.maintenance_priority || 'preventive';
+    const priorityClr = priorityColor(priority);
+    const buses = Array.isArray(d.bus_ids) ? d.bus_ids.join(', ') : '—';
+    const routes = Array.isArray(d.route_ids) ? d.route_ids.join(', ') : '—';
+    const confidence = d.average_confidence != null
+      ? Math.round(d.average_confidence * 100) + '%'
+      : '—';
+
+    const severity = (d.severity || 'unknown').toUpperCase();
+    const consensus = consensusLabel(d.consensus_status);
+
+    const trend = (d.severity_trend || 'stable').toUpperCase();
+    const trendSymbol =
+      trend === 'WORSENING' ? '↑' :
+      trend === 'IMPROVING' ? '↓' : '→';
+
+    const maintStatus =
+      (d.maintenance_status || 'pending')
+        .replace(/_/g, ' ')
+        .toUpperCase();
+
+    const action =
+      d.recommended_action ||
+      'Flag for preventive maintenance';
+
+    const header = resolved
+      ? 'ROAD DEFECT — RESOLVED'
+      : 'PERSISTENT ROAD DEFECT';
+
+    const maintenanceText = resolved
+      ? 'RESOLVED'
+      : 'REQUIRED';
+
+    const maintenanceColor = resolved
+      ? '#30D158'
+      : priorityClr;
+
+    const priorityText = resolved
+      ? 'RESOLVED'
+      : priorityLabel(priority);
+
+    const verificationPasses =
+      Number(d.verification_passes || 0);
+
+    const verificationRequired =
+      Number(d.verification_required_passes || 3);
+
+    const verificationStatus =
+      (d.verification_status || '')
+        .toLowerCase();
+
+    let lifecycleHtml = '';
+
+    if (resolved || verificationStatus === 'in_progress' ||
+        maintStatus === 'POST REPAIR MONITORING') {
+
+      const passText =
+        `${verificationPasses}/${verificationRequired} CLEAR`;
+
+      const verifiedBuses =
+        Array.isArray(d.verification_bus_ids)
+          ? d.verification_bus_ids.join(', ')
+          : '—';
+
+      lifecycleHtml = `
+        <div style="margin-top:6px;padding-top:6px;border-top:1px solid #ffffff12">
+          <div style="color:#6b6b80">Post-repair verification
+            <b style="color:#30D158">${passText}</b>
+          </div>
+          ${verificationStatus === 'verified' || resolved
+            ? `<div style="color:#6b6b80">Verified by
+                 <span style="color:#e8e8f0">${verifiedBuses}</span>
+               </div>
+               <div style="color:#6b6b80">Verification status
+                 <b style="color:#30D158">VERIFIED</b>
+               </div>`
+            : `<div style="color:#6b6b80">Verification status
+                 <b style="color:#FF9500">${verificationStatus.replace(/_/g, ' ').toUpperCase() || 'PENDING'}</b>
+               </div>`
+          }
+        </div>`;
+    }
+
+    return `
+      <div style="min-width:255px;line-height:1.65">
+        <div style="font-size:13px;font-weight:700;color:${color};margin-bottom:5px">${header}</div>
+        <div style="font-size:12px;margin-bottom:8px">${id}</div>
+
+        <div><span style="color:#6b6b80">Severity</span>
+          <b style="color:${color}">${severity}</b>
+        </div>
+
+        <div><span style="color:#6b6b80">Observations</span>
+          ${d.observation_count ?? 0}
+        </div>
+
+        <div><span style="color:#6b6b80">Unique buses</span>
+          ${d.unique_bus_count ?? 0}
+        </div>
+
+        <div><span style="color:#6b6b80">Routes</span>
+          ${d.unique_route_count ?? routes.split(', ').filter(Boolean).length}
+        </div>
+
+        <div><span style="color:#6b6b80">Avg. confidence</span>
+          ${confidence}
+        </div>
+
+        <div><span style="color:#6b6b80">Fleet consensus</span>
+          <b>${consensus}</b>
+        </div>
+
+        ${resolved ? '' : `
+        <div><span style="color:#6b6b80">Trend</span>
+          <b style="color:${
+            trend === 'WORSENING'
+              ? '#FF9500'
+              : trend === 'IMPROVING'
+                ? '#30D158'
+                : '#e8e8f0'
+          }">${trendSymbol} ${trend}</b>
+        </div>
+        `}
+
+        <div><span style="color:#6b6b80">Maintenance</span>
+          <b style="color:${maintenanceColor}">${maintenanceText}</b>
+        </div>
+
+        <div><span style="color:#6b6b80">Priority</span>
+          <b style="color:${maintenanceColor}">${priorityText}</b>
+        </div>
+
+        <div><span style="color:#6b6b80">Status</span>
+          ${maintStatus}
+        </div>
+
+        ${lifecycleHtml}
+
+        ${!resolved ? `
+        <div style="margin-top:6px;padding-top:6px;border-top:1px solid #ffffff12;color:#6b6b80;font-size:9px">
+          Action:
+          <span style="color:#e8e8f0">${action}</span>
+        </div>
+        ` : ''}
+
+        <div style="margin-top:5px;color:#6b6b80;font-size:9px">
+          Buses: ${buses}
+        </div>
+      </div>`;
+  }
+
+  function roadDefectStyle(d) {
+    const resolved = isResolvedDefect(d);
+
+    if (resolved) {
+      return {
+        radius: 13,
+        color: '#30D158',
+        weight: 2,
+        opacity: 0.85,
+        fillColor: '#30D158',
+        fillOpacity: 0.08,
+        dashArray: '4 4'
+      };
+    }
+
+    const color = roadDefectColor(d);
+    const severity = d.severity || 'minor';
+    const size =
+      severity === 'severe' ? 22 :
+      severity === 'moderate' ? 18 : 15;
+
+    return {
+      radius: size,
+      color: color,
+      weight: 2,
+      opacity: 0.95,
+      fillColor: color,
+      fillOpacity: 0.16
+    };
+  }
+
+  // ── Modal for image preview ───────────────────────────────────────────
+  window.openDetail = function(id) {
+    const d = allDocs[id];
+    if (!d) return;
+    const color = severityColor(d.severity);
+    document.getElementById('modal-sev').textContent = (d.severity || 'unknown').toUpperCase();
+    document.getElementById('modal-sev').style.color = color;
+    document.getElementById('modal-conf').textContent = d.confidence ? Math.round(d.confidence*100)+'%' : '—';
+    document.getElementById('modal-loc').textContent = (d.lat ? d.lat.toFixed(6) : '—') + '°N, ' + (d.lng ? d.lng.toFixed(6) : '—') + '°E';
+    document.getElementById('modal-time').textContent = formatTime(d.timestamp);
+    document.getElementById('modal-acc').textContent = d.accuracy && d.accuracy.trim() ? d.accuracy : '—';
+    document.getElementById('modal-road').textContent = d.road_defect_id || 'Not linked';
+    document.getElementById('modal-source').textContent = [d.bus_id, d.route_id, d.camera_id].filter(Boolean).join(' · ') || 'BUS CAMERA';
+    const linkedDefect = d.road_defect_id ? roadDefectDocs[d.road_defect_id] : null;
+    if (linkedDefect) {
+      const resolved = isResolvedDefect(linkedDefect);
+      const p = priorityLabel(linkedDefect.maintenance_priority);
+
+      document.getElementById('modal-maintenance').textContent =
+        resolved
+          ? 'RESOLVED'
+          : (
+              linkedDefect.maintenance_required === false
+                ? 'NOT REQUIRED'
+                : p + ' · REQUIRED'
+            );
+    } else {
+      document.getElementById('modal-maintenance').textContent = '—';
+    }
+
+    const imgWrap = document.getElementById('modal-img-wrap');
+    const imgSrc = d.image_data || d.image_url;
+    if (imgSrc) {
+      imgWrap.innerHTML = `<img src="${imgSrc}" alt="Pothole capture" />`;
+    } else {
+      imgWrap.innerHTML = `<div class="no-img">📷<br>No image captured for this detection</div>`;
+    }
+    document.getElementById('modal-overlay').classList.add('active');
+  };
+
+  window.closeDetail = function() {
+    document.getElementById('modal-overlay').classList.remove('active');
+  };
+
+  function renderLatestBusFeed() {
+    const feed = document.getElementById('feed');
+    if (!feed) return;
+
+    const docs = Object.entries(busFeedDocs)
+      .map(([id, d]) => ({ id, d }))
+      .sort((a, b) => {
+        const ta = a.d.timestamp?.toDate ? a.d.timestamp.toDate().getTime() : new Date(a.d.timestamp || 0).getTime();
+        const tb = b.d.timestamp?.toDate ? b.d.timestamp.toDate().getTime() : new Date(b.d.timestamp || 0).getTime();
+        return tb - ta;
+      })
+      .slice(0, 12);
+
+    feed.innerHTML = '';
+
+    if (docs.length === 0) {
+      feed.innerHTML = `
+        <div class="empty-feed">
+          <div class="empty-icon">📡</div>
+          <div>Waiting for bus-camera detections...</div>
+          <div style="font-size:9px;opacity:0.6">Start detect_live.py to see data</div>
+        </div>`;
+      const count = document.getElementById('feed-count');
+      if (count) count.textContent = 'LATEST 0';
+      return;
+    }
+
+    docs.forEach(({ id, d }) => {
+      const color = severityColor(d.severity);
+      const item = document.createElement('div');
+      item.id = 'feed-' + id;
+      item.className = 'feed-item';
+      item.dataset.severity = d.severity || 'minor';
+
+      item.innerHTML = `
+        <div class="feed-dot" style="background:${color};box-shadow:0 0 8px ${color}88"></div>
+        <div class="feed-content">
+          <div class="feed-header">
+            <span class="feed-severity" style="color:${color}">${(d.severity || 'unknown').toUpperCase()}</span>
+            <span class="feed-conf">${d.confidence ? Math.round(d.confidence * 100) + '%' : '—'}</span>
+          </div>
+          <div class="feed-loc">${d.lat != null ? Number(d.lat).toFixed(5) : '—'}°N, ${d.lng != null ? Number(d.lng).toFixed(5) : '—'}°E</div>
+          <div class="feed-meta">${[d.bus_id, d.route_id, d.camera_id].filter(Boolean).join(' · ') || 'BUS CAMERA'}</div>
+          <div class="feed-time">${formatTime(d.timestamp)}</div>
+        </div>
+        ${(d.image_data || d.image_url) ? '<div class="feed-thumb-badge">📷</div>' : ''}
+      `;
+
+      item.onclick = () => {
+        openDetail(id);
+        if (d.lat != null && d.lng != null) map.setView([Number(d.lat), Number(d.lng)], 17);
+      };
+
+      feed.appendChild(item);
+    });
+
+    const count = document.getElementById('feed-count');
+    if (count) count.textContent = `LATEST ${docs.length}`;
+    applyFilter();
+  }
+
+  function addFeedItem(doc) {
+    const id = doc.id;
+    const d = doc.data();
+    allDocs[id] = d;
+
+    // Only TransitEye bus-camera detections belong in the live presentation feed.
+    if (!d.bus_id) return;
+
+    busFeedDocs[id] = d;
+    renderLatestBusFeed();
+  }
+
+  function updateStats() {
+    document.getElementById('stat-total').textContent = totalCount;
+    document.getElementById('stat-severe').textContent = sevCount;
+    document.getElementById('stat-moderate').textContent = modCount;
+    document.getElementById('stat-minor').textContent = minorCount;
+    document.getElementById('leg-severe').textContent = sevCount;
+    document.getElementById('leg-moderate').textContent = modCount;
+    document.getElementById('leg-minor').textContent = minorCount;
+    const pct = totalCount > 0 ? Math.round(sevCount/totalCount*100) : 0;
+    document.getElementById('critical-pct').textContent = pct + '% critical';
+    drawChart();
+  }
+
+  function drawChart() {
+    const canvas = document.getElementById('chart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const total = minorCount + modCount + sevCount;
+    if (total === 0) {
+      ctx.beginPath();
+      ctx.arc(W/2, H/2, H/2 - 4, 0, Math.PI*2);
+      ctx.strokeStyle = '#ffffff18';
+      ctx.lineWidth = 14;
+      ctx.stroke();
+      return;
+    }
+    const data = [
+      { val: sevCount, color: '#FF3B3B' },
+      { val: modCount, color: '#FF9500' },
+      { val: minorCount, color: '#30D158' }
+    ];
+    let start = -Math.PI / 2;
+    data.forEach(d => {
+      if (d.val === 0) return;
+      const slice = (d.val / total) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(W/2, H/2);
+      ctx.arc(W/2, H/2, H/2 - 4, start, start + slice);
+      ctx.closePath();
+      ctx.fillStyle = d.color;
+      ctx.fill();
+      start += slice;
+    });
+    ctx.beginPath();
+    ctx.arc(W/2, H/2, H/2 - 22, 0, Math.PI * 2);
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fill();
+  }
+
+  function updateMaintenanceStats() {
+    const docs = Object.values(roadDefectDocs);
+
+    let required = 0;
+    let scheduled = 0;
+    let urgent = 0;
+
+    docs.forEach(d => {
+      const resolved = isResolvedDefect(d);
+      if (resolved) return;
+
+      if (d.maintenance_required !== false) {
+        required++;
+      }
+
+      const p = (d.maintenance_priority || '').toLowerCase();
+
+      if (p === 'scheduled') {
+        scheduled++;
+      }
+
+      if (
+        p === 'high' ||
+        p === 'urgent' ||
+        p === 'critical'
+      ) {
+        urgent++;
+      }
+    });
+
+    const set = (id, value) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    };
+
+    set('maint-required', required);
+    set('maint-scheduled', scheduled);
+    set('maint-high', urgent);
+    set('road-defect-total', docs.length);
+  }
+
+  function applyFilter() {
+    Object.entries(markers).forEach(([id, m]) => {
+      const visible = currentFilter === 'all' || m.severity === currentFilter;
+      if (visible) {
+        if (!map.hasLayer(m.marker)) m.marker.addTo(map);
+      } else {
+        if (map.hasLayer(m.marker)) map.removeLayer(m.marker);
+      }
+    });
+
+    document.querySelectorAll('#feed .feed-item').forEach(el => {
+      const visible = currentFilter === 'all' || el.dataset.severity === currentFilter;
+      el.style.display = visible ? 'flex' : 'none';
+    });
+  }
+
+  window.toggleFollow = function(btn) {
+    followLatest = !followLatest;
+    btn.classList.toggle('active', followLatest);
+  };
+
+  window.filterMap = function(severity, btn) {
+    currentFilter = severity;
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    applyFilter();
+    fitView();
+  };
+
+  window.fitView = function() {
+    const visible = Object.values(markers).filter(
+      m => currentFilter === 'all' || m.severity === currentFilter
+    );
+    if (visible.length === 0) return;
+    const bounds = L.latLngBounds(visible.map(m => m.marker.getLatLng()));
+    map.fitBounds(bounds, { padding: [60, 60], maxZoom: 16 });
+  };
+
+  // ── Pothole layer toggle ───────────────────────────────────────────────
+  let potholeLayerVisible = true;
+
+  window.togglePotholeLayer = function(btn) {
+    potholeLayerVisible = !potholeLayerVisible;
+    btn.classList.toggle('active', potholeLayerVisible);
+
+    Object.values(markers).forEach(item => {
+      if (potholeLayerVisible) {
+        if (!map.hasLayer(item.marker)) item.marker.addTo(map);
+      } else {
+        if (map.hasLayer(item.marker)) map.removeLayer(item.marker);
+      }
+    });
+
+    Object.values(roadDefectMarkers).forEach(marker => {
+      if (potholeLayerVisible) {
+        if (!map.hasLayer(marker)) marker.addTo(map);
+      } else {
+        if (map.hasLayer(marker)) map.removeLayer(marker);
+      }
+    });
+  };
+
+  // ── Real-time Firestore listener ─────────────────────────────────────
+  const q = query(collection(db, 'detections'), orderBy('timestamp', 'desc'), limit(500));
+  onSnapshot(q, (snapshot) => {
+    snapshot.docChanges().forEach(change => {
+      try {
+        const id = change.doc.id;
+        const d = change.doc.data();
+
+        if (change.type === 'removed') {
+          delete allDocs[id];
+          delete busFeedDocs[id];
+
+          if (markers[id]) {
+            if (map.hasLayer(markers[id].marker)) map.removeLayer(markers[id].marker);
+            delete markers[id];
+          }
+
+          if (d.bus_id) {
+            totalCount = Math.max(0, totalCount - 1);
+            if (d.severity === 'severe') sevCount = Math.max(0, sevCount - 1);
+            else if (d.severity === 'moderate') modCount = Math.max(0, modCount - 1);
+            else minorCount = Math.max(0, minorCount - 1);
+          }
+
+          renderLatestBusFeed();
+          updateStats();
+          return;
+        }
+
+        allDocs[id] = d;
+
+        // Keep the presentation/dashboard focused on real bus-camera data.
+        if (!d.bus_id) return;
+
+        if (change.type === 'added') {
+          totalCount++;
+          if (d.severity === 'severe') sevCount++;
+          else if (d.severity === 'moderate') modCount++;
+          else minorCount++;
+
+          if (d.lat != null && d.lng != null) {
+            const marker = L.marker([Number(d.lat), Number(d.lng)], {
+              icon: severityIcon(d.severity)
+            }).addTo(map);
+
+            marker.on('click', () => openDetail(id));
+            markers[id] = { marker, severity: d.severity || 'minor' };
+            applyFilter();
+
+            const ring = L.circleMarker([Number(d.lat), Number(d.lng)], {
+              radius: 16,
+              color: severityColor(d.severity),
+              weight: 3,
+              opacity: 0.95,
+              fillOpacity: 0
+            }).addTo(map);
+
+            let r = 16;
+            const grow = setInterval(() => {
+              r += 4;
+              ring.setRadius(r);
+              ring.setStyle({ opacity: Math.max(0, 0.95 - (r - 16) / 40) });
+              if (r > 60) {
+                clearInterval(grow);
+                map.removeLayer(ring);
+              }
+            }, 70);
+
+            if (followLatest) map.panTo([Number(d.lat), Number(d.lng)]);
+          }
+
+          busFeedDocs[id] = d;
+          renderLatestBusFeed();
+          updateStats();
+
+          const liveDot = document.getElementById('live-dot');
+          if (liveDot) {
+            liveDot.style.background = '#30D158';
+            setTimeout(() => liveDot.style.background = '#30D15888', 500);
+          }
+        } else if (change.type === 'modified') {
+          busFeedDocs[id] = d;
+          renderLatestBusFeed();
+        }
+      } catch (err) {
+        console.error('⚠️ Error processing a detection — skipped, listener still active:', err, change.doc.id);
+      }
+    });
+  });
+
+
+
+  // ── Report generation ────────────────────────────────────────────────────
+  window.generateReport = async function() {
+    const btn = document.querySelector('button[onclick="generateReport()"]');
+    const original = btn ? btn.innerHTML : 'EXPORT REPORT ↗';
+    if (btn) { btn.disabled = true; btn.innerHTML = 'GENERATING…'; }
+
+    try {
+      const active = Object.values(roadDefectDocs).filter(d => !isResolvedDefect(d));
+      const resolved = Object.values(roadDefectDocs).filter(d => isResolvedDefect(d));
+      const required = active.filter(d => d.maintenance_required !== false).length;
+      const urgent = active.filter(d => ['high','urgent','critical'].includes(String(d.maintenance_priority || '').toLowerCase())).length;
+      const roadDefectCount = Object.keys(roadDefectDocs).length;
+      const nowText = new Date().toLocaleString('en-IN');
+
+      // Single-page A4 report. No extra pages are created.
+      if (window.jspdf && window.jspdf.jsPDF) {
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
+        const W = 210, H = 297;
+        const margin = 16;
+        const bg = [10,10,15];
+        const surface = [20,20,29];
+        const text = [232,232,240];
+        const muted = [145,145,165];
+        const line = [48,48,62];
+        const accent = [10,132,255];
+
+        doc.setFillColor(...bg);
+        doc.rect(0, 0, W, H, 'F');
+
+        // Header
+        let y = 20;
+        doc.setTextColor(...text);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(18);
+        doc.text('TRANSITEYE — URBAN INTELLIGENCE REPORT', margin, y);
+
+        y += 7;
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.setTextColor(...muted);
+        doc.text(nowText, margin, y);
+
+        y += 6;
+        doc.setDrawColor(...line);
+        doc.setLineWidth(0.35);
+        doc.line(margin, y, W - margin, y);
+
+        // Metric cards: 2 columns × 4 rows with perfectly aligned labels/values.
+        const cardW = (W - 2 * margin - 6) / 2;
+        const cardH = 22;
+        const gapX = 6;
+        const gapY = 5;
+        const metrics = [
+          ['TOTAL DETECTED', totalCount],
+          ['SEVERE', sevCount],
+          ['MODERATE', modCount],
+          ['MINOR', minorCount],
+          ['ROAD DEFECTS', roadDefectCount],
+          ['MAINTENANCE REQUIRED', required],
+          ['URGENT / HIGH / CRITICAL', urgent],
+          ['RESOLVED', resolved.length]
+        ];
+
+        y += 9;
+        metrics.forEach((m, i) => {
+          const col = i % 2;
+          const row = Math.floor(i / 2);
+          const x = margin + col * (cardW + gapX);
+          const cy = y + row * (cardH + gapY);
+
+          doc.setFillColor(...surface);
+          doc.setDrawColor(...line);
+          doc.roundedRect(x, cy, cardW, cardH, 2.2, 2.2, 'FD');
+
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(8.3);
+          doc.setTextColor(...muted);
+          doc.text(m[0], x + 6, cy + 8);
+
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(15);
+          doc.setTextColor(...text);
+          doc.text(String(m[1]), x + cardW - 6, cy + 14, { align: 'right' });
+        });
+
+        y += 4 * (cardH + gapY) + 3;
+
+        // Situation overview section
+        doc.setTextColor(...text);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(12.5);
+        doc.text('Situation Overview', margin, y);
+
+        y += 7;
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9.2);
+        doc.setTextColor(...muted);
+        const overview = 'TransitEye aggregates bus-camera pothole observations with persistent road-defect records, severity, confidence, fleet consensus and maintenance workflow state into a single GIS-oriented operational view.';
+        const ov = doc.splitTextToSize(overview, W - 2 * margin);
+        doc.text(ov, margin, y, { lineHeightFactor: 1.35 });
+        y += ov.length * 4.8 + 8;
+
+        // Severity distribution block
+        doc.setFillColor(...surface);
+        doc.setDrawColor(...line);
+        const shareH = 42;
+        doc.roundedRect(margin, y, W - 2 * margin, shareH, 2.2, 2.2, 'FD');
+
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(9);
+        doc.setTextColor(...text);
+        doc.text('SEVERITY DISTRIBUTION', margin + 7, y + 8);
+
+        const shares = [
+          ['Severe share', totalCount ? Math.round(sevCount / totalCount * 100) + '%' : '0%'],
+          ['Moderate share', totalCount ? Math.round(modCount / totalCount * 100) + '%' : '0%'],
+          ['Minor share', totalCount ? Math.round(minorCount / totalCount * 100) + '%' : '0%']
+        ];
+        const colW = (W - 2 * margin - 14) / 3;
+        shares.forEach((s, i) => {
+          const sx = margin + 7 + i * colW;
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(8.5);
+          doc.setTextColor(...muted);
+          doc.text(s[0], sx, y + 19);
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(17);
+          doc.setTextColor(...text);
+          doc.text(s[1], sx, y + 32);
+        });
+
+        // Footer
+        doc.setDrawColor(...line);
+        doc.line(margin, H - 17, W - margin, H - 17);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(7.5);
+        doc.setTextColor(...muted);
+        doc.text('Generated from the current TransitEye dashboard state', margin, H - 11);
+        doc.setTextColor(...accent);
+        doc.text('TRANSITEYE', W - margin, H - 11, { align: 'right' });
+
+        doc.save(`TransitEye_Report_${new Date().toISOString().slice(0,10)}.pdf`);
+        return;
+      }
+
+      // Fallback: also remains a single printable page.
+      const reportWindow = window.open('', '_blank');
+      if (!reportWindow) throw new Error('Popup blocked. Please allow pop-ups for this file.');
+
+      const severeShare = totalCount ? Math.round(sevCount / totalCount * 100) : 0;
+      const moderateShare = totalCount ? Math.round(modCount / totalCount * 100) : 0;
+      const minorShare = totalCount ? Math.round(minorCount / totalCount * 100) : 0;
+
+      reportWindow.document.write(`<!doctype html>
+<html><head><title>TransitEye Report</title>
+<style>
+@page{size:A4 portrait;margin:0}
+*{box-sizing:border-box}
+body{margin:0;background:#0a0a0f;color:#e8e8f0;font-family:Arial,sans-serif}
+.page{width:210mm;height:297mm;padding:16mm;overflow:hidden}
+h1{margin:0;font-size:23px;letter-spacing:.2px}
+.date{margin-top:7px;color:#9191a5;font-size:12px}
+.rule{height:1px;background:#30303e;margin:6px 0 13px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:5mm 6mm}
+.card{height:22mm;background:#14141d;border:1px solid #30303e;border-radius:3mm;padding:6mm;display:flex;align-items:center;justify-content:space-between}
+.label{color:#9191a5;font-size:11px;font-weight:700}
+.value{font-size:19px;font-weight:700}
+h2{margin:11mm 0 4mm;font-size:17px}
+p{margin:0;color:#9191a5;font-size:12px;line-height:1.5}
+.share{margin-top:8mm;border:1px solid #30303e;border-radius:3mm;background:#14141d;padding:7mm}
+.share-title{font-size:11px;font-weight:700;margin-bottom:5mm}
+.shares{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}
+.share-label{color:#9191a5;font-size:11px}
+.share-value{font-size:22px;font-weight:700;margin-top:2mm}
+.footer{position:absolute;bottom:14mm;left:16mm;right:16mm;border-top:1px solid #30303e;padding-top:4mm;color:#9191a5;font-size:9px;display:flex;justify-content:space-between}
+.footer b{color:#0a84ff}
+</style></head><body>
+<div class="page">
+<h1>TRANSITEYE — URBAN INTELLIGENCE REPORT</h1>
+<div class="date">${nowText}</div><div class="rule"></div>
+<div class="grid">
+<div class="card"><span class="label">TOTAL DETECTED</span><span class="value">${totalCount}</span></div>
+<div class="card"><span class="label">SEVERE</span><span class="value">${sevCount}</span></div>
+<div class="card"><span class="label">MODERATE</span><span class="value">${modCount}</span></div>
+<div class="card"><span class="label">MINOR</span><span class="value">${minorCount}</span></div>
+<div class="card"><span class="label">ROAD DEFECTS</span><span class="value">${roadDefectCount}</span></div>
+<div class="card"><span class="label">MAINTENANCE REQUIRED</span><span class="value">${required}</span></div>
+<div class="card"><span class="label">URGENT / HIGH / CRITICAL</span><span class="value">${urgent}</span></div>
+<div class="card"><span class="label">RESOLVED</span><span class="value">${resolved.length}</span></div>
+</div>
+<h2>Situation Overview</h2>
+<p>TransitEye aggregates bus-camera pothole observations with persistent road-defect records, severity, confidence, fleet consensus and maintenance workflow state into a single GIS-oriented operational view.</p>
+<div class="share"><div class="share-title">SEVERITY DISTRIBUTION</div><div class="shares">
+<div><div class="share-label">Severe share</div><div class="share-value">${severeShare}%</div></div>
+<div><div class="share-label">Moderate share</div><div class="share-value">${moderateShare}%</div></div>
+<div><div class="share-label">Minor share</div><div class="share-value">${minorShare}%</div></div>
+</div></div>
+<div class="footer"><span>Generated from the current TransitEye dashboard state</span><b>TRANSITEYE</b></div>
+</div>
+<script>window.onload=()=>setTimeout(()=>window.print(),250);<\/script>
+</body></html>`);
+      reportWindow.document.close();
+    } catch (err) {
+      console.error('Report generation failed:', err);
+      alert('Report generation failed: ' + err.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.innerHTML = original; }
+    }
+  };
+  // ── Persistent road-defect listener ──────────────────────────────────────
+  // This layer represents remembered problems rather than individual camera
+  // observations. The existing detection markers remain untouched.
+  const roadDefectsQuery = query(
+    collection(db, 'road_defects'),
+    orderBy('last_seen', 'desc'),
+    limit(300)
+  );
+
+  onSnapshot(roadDefectsQuery, (snapshot) => {
+    snapshot.docChanges().forEach(change => {
+      try {
+        const id = change.doc.id;
+
+        if (change.type === 'removed') {
+          delete roadDefectDocs[id];
+          if (roadDefectMarkers[id]) {
+            map.removeLayer(roadDefectMarkers[id]);
+            delete roadDefectMarkers[id];
+          }
+          return;
+        }
+
+        const d = change.doc.data();
+        roadDefectDocs[id] = d;
+
+        if (d.lat == null || d.lng == null) return;
+
+        const latLng = [Number(d.lat), Number(d.lng)];
+
+        if (!roadDefectMarkers[id]) {
+          const marker = L.circleMarker(latLng, roadDefectStyle(d)).addTo(map);
+          marker.bindPopup(roadDefectPopup(id, d));
+          marker.on('click', () => {
+            marker.setPopupContent(roadDefectPopup(id, d));
+          });
+          roadDefectMarkers[id] = marker;
+        } else {
+          const marker = roadDefectMarkers[id];
+          marker.setLatLng(latLng);
+          marker.setStyle(roadDefectStyle(d));
+          marker.setPopupContent(roadDefectPopup(id, d));
+        }
+      } catch (err) {
+        console.error('⚠️ Error processing road defect:', err, change.doc.id);
+      }
+    });
+
+    updateMaintenanceStats();
+  });
+
+
+  // ── Additional map layers ─────────────────────────────────────────────
+  const trafficStaticMarkers = [];
+  const waterStaticMarkers = [];
+  const incidentMarkers = {};
+
+  const TRAFFIC_POINTS = [
+    [18.5211, 73.8569, 'HIGH', 52],
+    [18.5274, 73.8521, 'HIGH', 44],
+    [18.5162, 73.8617, 'MEDIUM', 31],
+    [18.5331, 73.8428, 'MEDIUM', 26],
+    [18.5079, 73.8488, 'MEDIUM', 22],
+    [18.5148, 73.8770, 'LOW', 7]
+  ];
+
+  const WATER_POINTS = [
+    [18.5239, 73.8622],
+    [18.5312, 73.8501],
+    [18.5094, 73.8552]
+  ];
+
+  const INCIDENTS = [
+    { id:'INC-01', lat:18.46960, lng:73.87210, type:'SUSPECTED RASH DRIVING', vehicle:'Car', plate:'MH12AB1234', confidence:91, time:'09:31:18 AM' },
+    { id:'INC-02', lat:18.45890, lng:73.86170, type:'SUSPECTED HIT-AND-RUN', vehicle:'Motorcycle', plate:'UNKNOWN', confidence:63, time:'09:34:07 AM' },
+    { id:'INC-03', lat:18.47190, lng:73.86320, type:'SUSPECTED RASH DRIVING', vehicle:'SUV', plate:'MH14CD5678', confidence:87, time:'09:36:42 AM' }
+  ];
+
+  function addStaticLayerMarkers() {
+    const densityColor = level =>
+      level === 'HIGH' ? '#FF3B3B' :
+      level === 'MEDIUM' ? '#FF9500' : '#30D158';
+
+    TRAFFIC_POINTS.forEach(([lat, lng, level, count]) => {
+      const marker = L.circleMarker([lat, lng], {
+        radius: level === 'HIGH' ? 16 : level === 'MEDIUM' ? 13 : 10,
+        color: densityColor(level),
+        fillColor: densityColor(level),
+        weight: 2,
+        opacity: 0.9,
+        fillOpacity: 0.12
+      });
+      marker.bindPopup(`
+        <div style="min-width:180px;line-height:1.7">
+          <div style="font-weight:700;color:${densityColor(level)}">TRAFFIC — ${level}</div>
+          <div><span style="color:#6b6b80">Vehicles</span> ${count}</div>
+        </div>`);
+      marker.addTo(map);
+      trafficStaticMarkers.push(marker);
+    });
+
+    WATER_POINTS.forEach(([lat, lng], idx) => {
+      const marker = L.circleMarker([lat, lng], {
+        radius: 7,
+        color: '#2aa7c7',
+        fillColor: '#2aa7c7',
+        weight: 2,
+        opacity: 0.9,
+        fillOpacity: 0.18
+      });
+      marker.bindPopup(`
+        <div style="font-size:11px;color:#2aa7c7;font-weight:700">WATERLOGGING</div>
+        <div style="font-size:9px;color:#6b6b80">Area ${idx + 1}</div>`);
+      waterStaticMarkers.push(marker);
+    });
+
+    INCIDENTS.forEach(item => {
+      const color = item.type.includes('HIT') ? '#ff2d92' : '#FF9500';
+      const marker = L.circleMarker([item.lat, item.lng], {
+        radius: 8,
+        color,
+        fillColor: color,
+        weight: 2,
+        opacity: 0.95,
+        fillOpacity: 0.2
+      });
+      marker.bindPopup(`
+        <div style="min-width:210px;line-height:1.7">
+          <div style="color:${color};font-weight:700;font-size:12px">${item.type}</div>
+          <div><span style="color:#6b6b80">Incident</span> ${item.id}</div>
+          <div><span style="color:#6b6b80">Vehicle</span> ${item.vehicle}</div>
+          <div><span style="color:#6b6b80">Plate</span> ${item.plate}</div>
+          <div><span style="color:#6b6b80">Confidence</span> ${item.confidence}%</div>
+          <div><span style="color:#6b6b80">Time</span> ${item.time}</div>
+        </div>`);
+      marker.addTo(map);
+      incidentMarkers[item.id] = marker;
+    });
+  }
+
+  window.toggleStaticLayer = function(type, btn) {
+    const on = !btn.classList.contains('active');
+    btn.classList.toggle('active', on);
+
+    let group = [];
+    if (type === 'traffic') group = trafficStaticMarkers;
+    else if (type === 'water') group = waterStaticMarkers;
+    else if (type === 'incidents') group = Object.values(incidentMarkers);
+
+    group.forEach(marker => {
+      if (on) {
+        if (!map.hasLayer(marker)) marker.addTo(map);
+      } else if (map.hasLayer(marker)) {
+        map.removeLayer(marker);
+      }
+    });
+  };
+
+  addStaticLayerMarkers();
+</script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0a0a0f;
+  --surface: #111118;
+  --surface2: #1a1a24;
+  --border: #ffffff12;
+  --text: #e8e8f0;
+  --muted: #6b6b80;
+  --severe: #FF3B3B;
+  --moderate: #FF9500;
+  --minor: #30D158;
+  --accent: #0A84FF;
+  --font-mono: 'Space Mono', monospace;
+  --font-body: 'DM Sans', sans-serif;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  height: 100vh;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: 52px 1fr;
+  grid-template-columns: 280px 1fr 300px;
+  grid-template-areas:
+    "header header header"
+    "left map right";
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.7; transform: scale(1.3); }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+header {
+  grid-area: header;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  gap: 24px;
+  z-index: 1000;
+}
+
+.logo {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.logo-icon {
+  width: 28px; height: 28px;
+  background: var(--severe);
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px;
+}
+.live-badge {
+  display: flex; align-items: center; gap: 6px;
+  background: #30D15818;
+  border: 1px solid #30D15840;
+  border-radius: 20px;
+  padding: 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--minor);
+}
+#live-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--minor);
+  transition: background 0.3s;
+  animation: blink 2s infinite;
+}
+.header-stats { display: flex; gap: 2px; margin-left: auto; }
+.hstat {
+  padding: 4px 14px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  display: flex; align-items: center; gap: 6px;
+}
+.hstat-dot { width: 6px; height: 6px; border-radius: 50%; }
+.hstat-num { font-weight: 700; font-size: 13px; }
+.hstat-label { color: var(--muted); font-size: 9px; }
+
+.left-panel {
+  grid-area: left;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+.panel-section { padding: 16px; border-bottom: 1px solid var(--border); }
+.section-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+.stat-grid { display: grid; grid-template-columns: 1fr; gap: 8px; }
+.stat-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.stat-num { font-family: var(--font-mono); font-size: 36px; font-weight: 700; line-height: 1; margin-bottom: 2px; }
+.stat-sub { font-size: 10px; color: var(--muted); font-family: var(--font-mono); }
+
+.chart-wrap { display: flex; align-items: center; gap: 16px; padding: 12px 0 4px; }
+canvas#chart { width: 80px !important; height: 80px !important; flex-shrink: 0; }
+.legend { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.legend-item { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.legend-label { color: var(--muted); flex: 1; }
+.legend-val { font-family: var(--font-mono); font-size: 10px; }
+
+.filters { display: flex; gap: 4px; flex-wrap: wrap; }
+ .layer-row { display:flex; align-items:center; justify-content:space-between; padding:4px 0; }
+ .layer-left { display:flex; align-items:center; gap:8px; font-size:11px; }
+ .layer-right { display:flex; align-items:center; gap:8px; }
+ .layer-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; background:var(--severe); }
+ .layer-dot.pothole { background:var(--severe); }
+ .layer-dot.traffic { background:var(--moderate); }
+ .layer-dot.water { background:#2aa7c7; }
+ .layer-dot.incident { background:#ff2d92; }
+ .layer-toggle { width:34px; height:20px; border:1px solid var(--border); border-radius:12px; background:#2a2a38; cursor:pointer; padding:2px; transition:all .2s; }
+ .layer-toggle span { display:block; width:14px; height:14px; border-radius:50%; background:#8b8b9d; transition:transform .2s, background .2s; }
+ .layer-toggle.active { background:#168a43; border-color:#30D15866; }
+ .layer-toggle.active span { background:#30D158; transform:translateX(14px); }
+.filter-btn {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.filter-btn:hover { background: var(--surface2); color: var(--text); border-color: #ffffff30; }
+.filter-btn.active { background: var(--surface2); color: var(--text); border-color: var(--accent); }
+
+#map { grid-area: map; z-index: 1; }
+.leaflet-container { background: #060608; }
+
+.right-panel {
+  grid-area: right;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.feed-header-bar {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  color: var(--muted);
+  text-transform: uppercase;
+  display: flex; align-items: center; justify-content: space-between;
+}
+#feed { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 4px; }
+#feed::-webkit-scrollbar { width: 3px; }
+#feed::-webkit-scrollbar-track { background: transparent; }
+#feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.feed-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  animation: slideIn 0.3s ease;
+  position: relative;
+}
+.feed-item:hover { background: #1e1e2c; border-color: #ffffff20; }
+.feed-dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 4px; flex-shrink: 0; }
+.feed-content { flex: 1; min-width: 0; }
+.feed-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 3px; }
+.feed-severity { font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: 0.08em; }
+.feed-conf { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.feed-loc { font-size: 11px; color: var(--muted); margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.feed-time { font-family: var(--font-mono); font-size: 9px; color: #44445a; }
+.feed-meta { font-family: var(--font-mono); font-size: 9px; color: #56566a; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.maintenance-stat { display:flex; justify-content:space-between; font-size:11px; margin-bottom:6px; }
+.maintenance-stat:last-child { margin-bottom:0; }
+.maintenance-stat-label { color:var(--muted); font-family:var(--font-mono); }
+.maintenance-stat-value { font-family:var(--font-mono); font-size:10px; }
+.feed-thumb-badge {
+  position: absolute; top: 8px; right: 8px;
+  font-size: 11px; opacity: 0.6;
+}
+
+.empty-feed {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 100%; gap: 12px; color: var(--muted);
+  font-family: var(--font-mono); font-size: 11px; text-align: center; padding: 20px;
+}
+.empty-icon {
+  width: 48px; height: 48px;
+  border: 2px solid var(--border);
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; opacity: 0.4;
+}
+
+.leaflet-popup-content-wrapper {
+  background: var(--surface2) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  color: var(--text) !important;
+  font-family: var(--font-mono) !important;
+  font-size: 11px !important;
+  box-shadow: 0 8px 32px #00000080 !important;
+}
+.leaflet-popup-tip { background: var(--surface2) !important; }
+.leaflet-control-zoom a { background: var(--surface2) !important; border-color: var(--border) !important; color: var(--text) !important; }
+
+/* ── Detail Modal ─────────────────────────────────────────────────── */
+#modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: #000000c0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 5000;
+  animation: fadeIn 0.2s ease;
+}
+#modal-overlay.active { display: flex; }
+.modal-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: 420px;
+  max-width: 92vw;
+  overflow: hidden;
+  box-shadow: 0 24px 64px #000000a0;
+}
+.modal-img-wrap {
+  width: 100%;
+  height: 260px;
+  background: #060608;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.modal-img-wrap img { width: 100%; height: 100%; object-fit: cover; }
+.no-img {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: center;
+  line-height: 1.8;
+}
+.modal-body { padding: 16px 18px; }
+.modal-sev-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+#modal-sev { font-family: var(--font-mono); font-size: 16px; font-weight: 700; letter-spacing: 0.05em; }
+.modal-close-btn {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  width: 28px; height: 28px;
+  cursor: pointer;
+  font-size: 14px;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal-close-btn:hover { color: var(--text); }
+.modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.modal-field { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.modal-field-label { font-family: var(--font-mono); font-size: 8px; color: var(--muted); letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 4px; }
+.modal-field-val { font-family: var(--font-mono); font-size: 12px; color: var(--text); }
+.modal-field.full { grid-column: 1 / -1; }
+</style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="logo"><div class="logo-icon">⚠</div>TRANSITEYE</div>
+  <div class="live-badge"><div id="live-dot"></div>LIVE</div>
+  <button class="filter-btn" onclick="toggleFollow(this)" style="font-size:9px">📍 FOLLOW LATEST</button>
+  <button class="filter-btn" onclick="generateReport()" style="font-size:9px">EXPORT REPORT ↗</button>
+  <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted)" id="clock"></div>
+
+  <div class="header-stats">
+    <div class="hstat">
+      <div class="hstat-dot" style="background:var(--severe)"></div>
+      <div><div class="hstat-num" id="stat-severe" style="color:var(--severe)">0</div><div class="hstat-label">SEVERE</div></div>
+    </div>
+    <div class="hstat">
+      <div class="hstat-dot" style="background:var(--moderate)"></div>
+      <div><div class="hstat-num" id="stat-moderate" style="color:var(--moderate)">0</div><div class="hstat-label">MODERATE</div></div>
+    </div>
+    <div class="hstat">
+      <div class="hstat-dot" style="background:var(--minor)"></div>
+      <div><div class="hstat-num" id="stat-minor" style="color:var(--minor)">0</div><div class="hstat-label">MINOR</div></div>
+    </div>
+  </div>
+</header>
+
+<aside class="left-panel">
+  <div class="panel-section">
+    <div class="section-label">Overview</div>
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-num" id="stat-total">0</div>
+        <div class="stat-sub">TOTAL DETECTED</div>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="chart" width="80" height="80"></canvas>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-dot" style="background:var(--severe)"></div><span class="legend-label">Severe</span><span class="legend-val" id="leg-severe">0</span></div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--moderate)"></div><span class="legend-label">Moderate</span><span class="legend-val" id="leg-moderate">0</span></div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--minor)"></div><span class="legend-label">Minor</span><span class="legend-val" id="leg-minor">0</span></div>
+      </div>
+    </div>
+    <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);margin-top:4px" id="critical-pct">0% critical</div>
+  </div>
+
+  <div class="panel-section">
+    <div class="section-label">Filter Map</div>
+    <div class="filters">
+      <button class="filter-btn active" onclick="filterMap('all', this)">ALL</button>
+      <button class="filter-btn" onclick="filterMap('severe', this)" style="color:var(--severe)">SEVERE</button>
+      <button class="filter-btn" onclick="filterMap('moderate', this)" style="color:var(--moderate)">MODERATE</button>
+      <button class="filter-btn" onclick="filterMap('minor', this)" style="color:var(--minor)">MINOR</button>
+    </div>
+  </div>
+ 
+  <div class="panel-section">
+    <div class="section-label">Live Layers</div>
+    <div class="layer-row">
+      <div class="layer-left"><span class="layer-dot pothole"></span><span>Potholes</span></div>
+      <div class="layer-right"><button class="layer-toggle active" onclick="togglePotholeLayer(this)" aria-label="Toggle potholes"><span></span></button></div>
+    </div>
+    <div class="layer-row">
+      <div class="layer-left"><span class="layer-dot traffic"></span><span>Traffic</span></div>
+      <div class="layer-right"><button class="layer-toggle active" onclick="toggleStaticLayer('traffic', this)" aria-label="Toggle traffic"><span></span></button></div>
+    </div>
+    <div class="layer-row">
+      <div class="layer-left"><span class="layer-dot water"></span><span>Waterlogging</span></div>
+      <div class="layer-right"><button class="layer-toggle" onclick="toggleStaticLayer('water', this)" aria-label="Toggle waterlogging"><span></span></button></div>
+    </div>
+    <div class="layer-row">
+      <div class="layer-left"><span class="layer-dot incident"></span><span>Incidents</span></div>
+      <div class="layer-right"><button class="layer-toggle active" onclick="toggleStaticLayer('incidents', this)" aria-label="Toggle incidents"><span></span></button></div>
+    </div>
+  </div>
+
+  <div class="panel-section">
+    <div class="section-label" style="font-weight:800;color:var(--text)">Maintenance</div>
+    <div style="display:flex;flex-direction:column;gap:7px">
+      <div class="maintenance-stat">
+        <span class="maintenance-stat-label">ROAD DEFECTS</span>
+        <span class="maintenance-stat-value" id="road-defect-total">0</span>
+      </div>
+      <div class="maintenance-stat">
+        <span class="maintenance-stat-label">REQUIRED</span>
+        <span class="maintenance-stat-value" id="maint-required">0</span>
+      </div>
+      <div class="maintenance-stat">
+        <span class="maintenance-stat-label">SCHEDULED</span>
+        <span class="maintenance-stat-value" id="maint-scheduled" style="color:#e8e8f0">0</span>
+      </div>
+      <div class="maintenance-stat">
+        <span class="maintenance-stat-label">URGENT</span>
+        <span class="maintenance-stat-value" id="maint-high" style="color:var(--moderate)">0</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel-section" style="border-bottom:none;flex:1">
+    <div class="section-label">System</div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <div style="display:flex;justify-content:space-between;font-size:11px"><span style="color:var(--muted);font-family:var(--font-mono)">MODEL</span><span style="font-family:var(--font-mono);font-size:10px">YOLOv8s</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:11px"><span style="color:var(--muted);font-family:var(--font-mono)">CLASSES</span><span style="font-family:var(--font-mono);font-size:10px">3 severity</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:11px"><span style="color:var(--muted);font-family:var(--font-mono)">DB</span><span style="font-family:var(--font-mono);font-size:10px;color:var(--minor)">Firebase ●</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:11px"><span style="color:var(--muted);font-family:var(--font-mono)">REGION</span><span style="font-family:var(--font-mono);font-size:10px">Pune, IN</span></div>
+    </div>
+  </div>
+</aside>
+
+<div id="map"></div>
+
+<aside class="right-panel">
+  <div class="feed-header-bar"><span>Detection Feed</span><span id="feed-count" style="color:var(--accent)">LATEST 0</span></div>
+  <div id="feed">
+    <div class="empty-feed">
+      <div class="empty-icon">📡</div>
+      <div>Waiting for bus-camera detections...</div>
+      <div style="font-size:9px;opacity:0.6">Start detect_live.py to see data</div>
+    </div>
+  </div>
+</aside>
+
+<!-- Detail Modal -->
+<div id="modal-overlay" onclick="if(event.target===this) closeDetail()">
+  <div class="modal-card">
+    <div class="modal-img-wrap" id="modal-img-wrap">
+      <div class="no-img">📷<br>No image</div>
+    </div>
+    <div class="modal-body">
+      <div class="modal-sev-row">
+        <span id="modal-sev">—</span>
+        <button class="modal-close-btn" onclick="closeDetail()">✕</button>
+      </div>
+      <div class="modal-grid">
+        <div class="modal-field"><div class="modal-field-label">Confidence</div><div class="modal-field-val" id="modal-conf">—</div></div>
+        <div class="modal-field"><div class="modal-field-label">Accuracy</div><div class="modal-field-val" id="modal-acc">—</div></div>
+        <div class="modal-field full"><div class="modal-field-label">Location</div><div class="modal-field-val" id="modal-loc">—</div></div>
+        <div class="modal-field full"><div class="modal-field-label">Detected At</div><div class="modal-field-val" id="modal-time">—</div></div>
+        <div class="modal-field"><div class="modal-field-label">Road Defect</div><div class="modal-field-val" id="modal-road">—</div></div>
+        <div class="modal-field"><div class="modal-field-label">Source</div><div class="modal-field-val" id="modal-source">—</div></div>
+        <div class="modal-field full"><div class="modal-field-label">Maintenance</div><div class="modal-field-val" id="modal-maintenance">—</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function updateClock() {
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    now.toLocaleDateString('en-IN') + ' ' + now.toLocaleTimeString('en-IN', { hour12: false });
+}
+setInterval(updateClock, 1000);
+updateClock();
+</script>
+</body>
+</html>

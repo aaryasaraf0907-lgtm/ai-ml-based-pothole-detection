@@ -218,3 +218,34 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Firebase credentials and secrets
+serviceAccountKey.json
+firebase-service-account.json
+**/*serviceAccount*.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local datasets and unrelated modules
+dataset/
+dataset_labeled/
+raw_datasets/
+archive/
+traffic/
+*.mp4
+*.avi
+*.mov
+
+# macOS
+.DS_Store
+
+# Keep only the trained inference model under runs/
+runs/*
+!runs/pothole_severity_v2/
+runs/pothole_severity_v2/*
+!runs/pothole_severity_v2/weights/
+runs/pothole_severity_v2/weights/*
+!runs/pothole_severity_v2/weights/best.pt
